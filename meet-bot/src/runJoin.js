@@ -4,7 +4,7 @@ import { mkdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { transcribe } from './transcribe.js';
-import { enableCaptions, startCaptionBuffer } from './captions.js';
+import { enableCaptions, setCaptionLanguage, startCaptionBuffer } from './captions.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -194,6 +194,10 @@ export async function runJoin(meetUrl, { onEvent = () => {} } = {}) {
       // it live via the ref returned below.
       try {
         await enableCaptions(page, { onEvent });
+        await setCaptionLanguage(page, {
+          target: process.env.CAPTION_LANGUAGE || 'multi',
+          onEvent,
+        });
         await startCaptionBuffer(page, (entry) => {
           if (entry.debug) {
             onEvent({ type: 'caption-debug', text: entry.text });

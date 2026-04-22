@@ -39,6 +39,101 @@ export async function enableCaptions(page, { onEvent = () => {} } = {}) {
   onEvent({ type: 'captions-kbd-fallback' });
 }
 
+// Navigate Meet's Settings → Captions → Meeting language and pick `target`.
+// Meet's caption ASR defaults to English; for Russian/Ukrainian speech it
+// produces phonetic garbage unless the language is set explicitly.
+// `target` can be 'multi' (tries Multi-language first, falls back to Russian),
+// 'russian', 'ukrainian', 'english', etc. Selectors are guessed — function
+// is fully best-effort and logs progress so we can see where it breaks.
+export async function setCaptionLanguage(page, { target = 'multi', onEvent = () => {} } = {}) {
+  const log = (ev) => onEvent({ ...ev, component: 'caption-lang' });
+  try {
+    // 1. Open "More options" (bottom-toolbar 3-dot).
+    const moreBtn = page.getByRole('button', {
+      name: /more options|more actions|ещё параметры|дополнительные|більше параметрів/i,
+    });
+    if (!(await moreBtn.count().catch(() => 0))) {
+      log({ type: 'step-missing', step: 'more-options-button' });
+      return;
+    }
+    await moreBtn.first().click({ timeout: 5_000 });
+    log({ type: 'step-ok', step: 'more-options-opened' });
+    await page.waitForTimeout(500);
+
+    // 2. Click "Settings" in the popup menu.
+    const settingsItem = page.getByRole('menuitem', {
+      name: /^settings$|^настройки$|^налаштування$/i,
+    });
+    if (!(await settingsItem.count().catch(() => 0))) {
+      log({ type: 'step-missing', step: 'settings-menu-item' });
+      await page.keyboard.press('Escape').catch(() => {});
+      return;
+    }
+    await settingsItem.first().click({ timeout: 5_000 });
+    log({ type: 'step-ok', step: 'settings-opened' });
+    await page.waitForTimeout(1000);
+
+    // 3. Click the "Captions" tab in the Settings dialog.
+    const captionsTab = page.getByRole('tab', {
+      name: /captions|субтитры|субтитри/i,
+    });
+    if (await captionsTab.count().catch(() => 0)) {
+      await captionsTab.first().click({ timeout: 3_000 }).catch(() => {});
+      log({ type: 'step-ok', step: 'captions-tab' });
+    } else {
+      log({ type: 'step-missing', step: 'captions-tab', note: 'maybe already on captions pane' });
+    }
+    await page.waitForTimeout(500);
+
+    // 4. Open the Meeting language dropdown.
+    const langDropdown = page.locator(
+      '[role="combobox"][aria-label*="language" i], [role="combobox"][aria-label*="язык" i], [role="combobox"][aria-label*="мова" i], [aria-label*="meeting language" i]'
+    );
+    if (!(await langDropdown.count().catch(() => 0))) {
+      log({ type: 'step-missing', step: 'language-dropdown' });
+      await page.keyboard.press('Escape').catch(() => {});
+      return;
+    }
+    await langDropdown.first().click({ timeout: 5_000 });
+    log({ type: 'step-ok', step: 'dropdown-opened' });
+    await page.waitForTimeout(500);
+
+    // 5. Pick the target language. 'multi' tries Multi-language first, falls
+    //    back to Russian if that option isn't offered (free-tier accounts).
+    const tryOption = async (rx) => {
+      const opt = page.getByRole('option', { name: rx });
+      if (await opt.count().catch(() => 0)) {
+        await opt.first().click({ timeout: 3_000 });
+        return true;
+      }
+      return false;
+    };
+
+    let picked = null;
+    if (target === 'multi') {
+      if (await tryOption(/multi[\s-]?language|несколько языков|мульти|кілька мов/i)) picked = 'multi';
+      else if (await tryOption(/russian|русский/i)) picked = 'russian';
+    } else if (target === 'russian' || target === 'ru') {
+      if (await tryOption(/russian|русский/i)) picked = 'russian';
+    } else if (target === 'ukrainian' || target === 'uk' || target === 'ua') {
+      if (await tryOption(/ukrainian|украинский|українська/i)) picked = 'ukrainian';
+    } else {
+      if (await tryOption(new RegExp(target, 'i'))) picked = target;
+    }
+
+    if (picked) log({ type: 'language-set', target, picked });
+    else log({ type: 'language-not-found', target });
+
+    // 6. Close the settings dialog.
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Escape').catch(() => {});
+  } catch (err) {
+    log({ type: 'error', message: err.message });
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+}
+
 export async function startCaptionBuffer(page, onEntry) {
   await page.exposeFunction('__captionEmit', (entry) => {
     try { onEntry(entry); } catch {}
