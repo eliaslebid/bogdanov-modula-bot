@@ -1,0 +1,13 @@
+{
+  "name": "bogdanov-meet-bot",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "join": "node --env-file-if-exists=.env src/join.js",
+    "serve": "node --env-file-if-exists=.env src/server.js"
+  },
+  "dependencies": {
+    "playwright": "1.49.1"
+  }
+}

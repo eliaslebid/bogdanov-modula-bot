@@ -1,2 +1,7 @@
 node_modules/
 .env
+.env.*
+!.env.example
+.chat-history.json
+.telegram-ids.json
+MEMORY.md
