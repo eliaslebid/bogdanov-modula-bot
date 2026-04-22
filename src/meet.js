@@ -1,6 +1,6 @@
-import { config } from './config.js';
 import { sendMessage } from './telegram.js';
 import { meetAnnouncement, meetSummary } from './ai.js';
+import * as meetBot from './meetBotClient.js';
 
 const MEET_URL_RX = /https:\/\/meet\.google\.com\/[a-z0-9-]{3,}/i;
 
@@ -25,56 +25,49 @@ async function announce(status, { fromName, meetUrl, reason }) {
   }
 }
 
+function clientErrorReason(err) {
+  return err.code === 'NOT_CONFIGURED'
+    ? 'MEET_BOT_URL не настроен'
+    : `meet-bot не отвечает (${err.message})`;
+}
+
 async function triggerJoin({ fromName, meetUrl }) {
-  const meetBotUrl = config.meetBotUrl;
-  if (!meetBotUrl) {
-    console.error('[meet] MEET_BOT_URL not configured — skipping join trigger');
-    await announce('failed', { fromName, meetUrl, reason: 'MEET_BOT_URL не настроен' });
-    return;
-  }
-
-  let res;
+  let result;
   try {
-    res = await fetch(`${meetBotUrl}/join`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ meetUrl }),
-      signal: AbortSignal.timeout(15_000),
-    });
+    result = await meetBot.join(meetUrl);
   } catch (err) {
-    console.error('[meet] meet-bot unreachable:', err.message);
-    await announce('failed', { fromName, meetUrl, reason: `meet-bot не отвечает (${err.message})` });
+    const reason = clientErrorReason(err);
+    console.error(`[meet] triggerJoin failed: ${reason}`);
+    await announce('failed', { fromName, meetUrl, reason });
     return;
   }
 
-  const data = await res.json().catch(() => ({}));
-  console.log(`[meet] meet-bot /join → ${res.status}`, data);
+  const { status, data } = result;
+  console.log(`[meet] meet-bot /join → ${status}`, data);
 
-  if (res.status === 202) {
+  if (status === 202) {
     await announce('joining', { fromName, meetUrl });
     // Poll /status until this job finishes, then post the summary.
     pollUntilFinished({ meetUrl, startedAt: data.startedAt, fromName }).catch((err) =>
       console.error('[meet] poll crashed:', err.message)
     );
-  } else if (res.status === 409) {
+  } else if (status === 409) {
     await announce('busy', { fromName, meetUrl });
   } else {
-    await announce('failed', { fromName, meetUrl, reason: data.error || `HTTP ${res.status}` });
+    await announce('failed', { fromName, meetUrl, reason: data.error || `HTTP ${status}` });
   }
 }
 
 // Polls /status every 30s (up to ~4 hours) until the job we kicked off is done,
 // then posts a summary if we got a transcript back.
 async function pollUntilFinished({ meetUrl, startedAt, fromName }) {
-  const meetBotUrl = config.meetBotUrl;
   const POLL_MS = 30_000;
   const MAX_ATTEMPTS = 480; // 4 hours ceiling
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
     await new Promise((r) => setTimeout(r, POLL_MS));
     let status;
     try {
-      const res = await fetch(`${meetBotUrl}/status`, { signal: AbortSignal.timeout(10_000) });
-      status = await res.json();
+      status = await meetBot.getStatus();
     } catch (err) {
       console.warn(`[meet] poll ${i + 1}: status fetch failed — ${err.message}`);
       continue;
@@ -114,23 +107,18 @@ async function pollUntilFinished({ meetUrl, startedAt, fromName }) {
 // meeting is active / meet-bot is unreachable. Used by the reply handler to
 // give Bogdanov in-call context for "what did we just discuss" questions.
 export async function getCurrentTranscript() {
-  const meetBotUrl = config.meetBotUrl;
-  if (!meetBotUrl) return null;
+  let data;
   try {
-    const res = await fetch(`${meetBotUrl}/transcript`, {
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    // Only return captions when a meeting is actively in progress. After it
-    // ends the summary post handles recap — the reply handler shouldn't keep
-    // injecting a stale call transcript.
-    if (data.done) return null;
-    return data.captions || [];
+    data = await meetBot.getTranscript();
   } catch (err) {
     console.warn('[meet] transcript fetch failed:', err.message);
     return null;
   }
+  // Only return captions when a meeting is actively in progress. After it
+  // ends the summary post handles recap — the reply handler shouldn't keep
+  // injecting a stale call transcript.
+  if (!data || data.done) return null;
+  return data.captions || [];
 }
 
 // Call this from the onAnyMessage handler in index.js.
