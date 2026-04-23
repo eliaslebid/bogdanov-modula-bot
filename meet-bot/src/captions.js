@@ -104,9 +104,12 @@ export async function setCaptionLanguage(page, { target = 'multi', onEvent = () 
 
   try {
     // 1. Open "More options" (bottom-toolbar 3-dot).
+    //    Anchored to exact match — unanchored regex also matched the
+    //    self-tile button "More options for <name>", which opens a different
+    //    menu (mute/pin/etc.) with no Settings item.
     log({ type: 'step-begin', step: '1-more-options' });
     const moreBtn = page.getByRole('button', {
-      name: /more options|more actions|ещё параметры|дополнительные|більше параметрів/i,
+      name: /^(more options|more actions|ещё параметры|дополнительные|більше параметрів)$/i,
     });
     const moreCount = await moreBtn.count().catch(() => 0);
     log({ type: 'step-probe', step: '1-more-options', count: moreCount });
