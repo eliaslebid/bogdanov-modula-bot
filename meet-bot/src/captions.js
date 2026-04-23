@@ -45,58 +45,140 @@ export async function enableCaptions(page, { onEvent = () => {} } = {}) {
 // `target` can be 'multi' (tries Multi-language first, falls back to Russian),
 // 'russian', 'ukrainian', 'english', etc. Selectors are guessed — function
 // is fully best-effort and logs progress so we can see where it breaks.
-export async function setCaptionLanguage(page, { target = 'multi', onEvent = () => {} } = {}) {
+//
+// Debug: on any missing step or failed language pick, dumps a screenshot +
+// full-page HTML to `meet-bot/debug/` so we can see what Meet actually
+// rendered. Also enumerates every visible combobox (with its aria-label) and
+// every role=option under the open dropdown — that's usually enough to spot
+// the real selector/name Meet is using.
+export async function setCaptionLanguage(page, { target = 'multi', onEvent = () => {}, debugDir } = {}) {
   const log = (ev) => onEvent({ ...ev, component: 'caption-lang' });
+
+  // Lazy-import so we don't pay the cost unless called.
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const dir = debugDir || join(fileURLToPath(new URL('..', import.meta.url)), 'debug');
+  await mkdir(dir, { recursive: true }).catch(() => {});
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  async function dump(label) {
+    const base = join(dir, `caption-lang-${stamp}-${label}`);
+    try {
+      await page.screenshot({ path: `${base}.png`, fullPage: false });
+      const html = await page.content();
+      await writeFile(`${base}.html`, html);
+      log({ type: 'debug-dump', label, png: `${base}.png`, html: `${base}.html` });
+    } catch (e) {
+      log({ type: 'debug-dump-failed', label, message: e.message });
+    }
+  }
+
+  async function listComboboxes() {
+    try {
+      const items = await page.locator('[role="combobox"]').evaluateAll((els) =>
+        els.map((el) => ({
+          label: el.getAttribute('aria-label') || '',
+          text: (el.innerText || '').slice(0, 80),
+          visible: !!(el.offsetWidth || el.offsetHeight),
+        }))
+      );
+      log({ type: 'debug-comboboxes', items });
+    } catch {}
+  }
+
+  async function listOptions(note) {
+    try {
+      const items = await page.locator('[role="option"]').evaluateAll((els) =>
+        els.map((el) => ({
+          name: el.getAttribute('aria-label') || (el.innerText || '').trim().slice(0, 80),
+          selected: el.getAttribute('aria-selected') === 'true',
+        }))
+      );
+      log({ type: 'debug-options', note, count: items.length, items });
+    } catch {}
+  }
+
+  log({ type: 'enter', target });
+  await dump('00-start');
+
   try {
     // 1. Open "More options" (bottom-toolbar 3-dot).
+    log({ type: 'step-begin', step: '1-more-options' });
     const moreBtn = page.getByRole('button', {
       name: /more options|more actions|ещё параметры|дополнительные|більше параметрів/i,
     });
-    if (!(await moreBtn.count().catch(() => 0))) {
-      log({ type: 'step-missing', step: 'more-options-button' });
+    const moreCount = await moreBtn.count().catch(() => 0);
+    log({ type: 'step-probe', step: '1-more-options', count: moreCount });
+    if (!moreCount) {
+      log({ type: 'step-missing', step: '1-more-options' });
+      await dump('01-no-more-options');
       return;
     }
     await moreBtn.first().click({ timeout: 5_000 });
-    log({ type: 'step-ok', step: 'more-options-opened' });
+    log({ type: 'step-ok', step: '1-more-options-clicked' });
     await page.waitForTimeout(500);
+    await dump('01-after-more-options');
 
     // 2. Click "Settings" in the popup menu.
+    log({ type: 'step-begin', step: '2-settings' });
     const settingsItem = page.getByRole('menuitem', {
       name: /^settings$|^настройки$|^налаштування$/i,
     });
-    if (!(await settingsItem.count().catch(() => 0))) {
-      log({ type: 'step-missing', step: 'settings-menu-item' });
+    const settingsCount = await settingsItem.count().catch(() => 0);
+    log({ type: 'step-probe', step: '2-settings', count: settingsCount });
+    if (!settingsCount) {
+      log({ type: 'step-missing', step: '2-settings' });
+      await dump('02-no-settings-item');
       await page.keyboard.press('Escape').catch(() => {});
       return;
     }
     await settingsItem.first().click({ timeout: 5_000 });
-    log({ type: 'step-ok', step: 'settings-opened' });
+    log({ type: 'step-ok', step: '2-settings-clicked' });
     await page.waitForTimeout(1000);
+    await dump('02-after-settings');
 
     // 3. Click the "Captions" tab in the Settings dialog.
+    log({ type: 'step-begin', step: '3-captions-tab' });
     const captionsTab = page.getByRole('tab', {
       name: /captions|субтитры|субтитри/i,
     });
-    if (await captionsTab.count().catch(() => 0)) {
+    const tabCount = await captionsTab.count().catch(() => 0);
+    log({ type: 'step-probe', step: '3-captions-tab', count: tabCount });
+    if (tabCount) {
       await captionsTab.first().click({ timeout: 3_000 }).catch(() => {});
-      log({ type: 'step-ok', step: 'captions-tab' });
+      log({ type: 'step-ok', step: '3-captions-tab-clicked' });
     } else {
-      log({ type: 'step-missing', step: 'captions-tab', note: 'maybe already on captions pane' });
+      log({ type: 'step-missing', step: '3-captions-tab', note: 'maybe already on captions pane' });
     }
     await page.waitForTimeout(500);
+    await dump('03-after-captions-tab');
+
+    // Before trying to find the dropdown, enumerate everything combobox-like
+    // so we can see what labels Meet actually uses on this page.
+    await listComboboxes();
 
     // 4. Open the Meeting language dropdown.
+    log({ type: 'step-begin', step: '4-lang-dropdown' });
     const langDropdown = page.locator(
       '[role="combobox"][aria-label*="language" i], [role="combobox"][aria-label*="язык" i], [role="combobox"][aria-label*="мова" i], [aria-label*="meeting language" i]'
     );
-    if (!(await langDropdown.count().catch(() => 0))) {
-      log({ type: 'step-missing', step: 'language-dropdown' });
+    const dropdownCount = await langDropdown.count().catch(() => 0);
+    log({ type: 'step-probe', step: '4-lang-dropdown', count: dropdownCount });
+    if (!dropdownCount) {
+      log({ type: 'step-missing', step: '4-lang-dropdown' });
+      await dump('04-no-lang-dropdown');
       await page.keyboard.press('Escape').catch(() => {});
       return;
     }
     await langDropdown.first().click({ timeout: 5_000 });
-    log({ type: 'step-ok', step: 'dropdown-opened' });
+    log({ type: 'step-ok', step: '4-lang-dropdown-clicked' });
     await page.waitForTimeout(500);
+
+    // Dump the full option list — this is the single most useful debug
+    // signal: we get to see exactly what Meet named the Multi-language option.
+    await listOptions('dropdown-open');
+    await dump('04-dropdown-open');
 
     // 5. Pick the target language. 'multi' tries Multi-language first, falls
     //    back to Russian if that option isn't offered (free-tier accounts).
@@ -111,7 +193,7 @@ export async function setCaptionLanguage(page, { target = 'multi', onEvent = () 
 
     let picked = null;
     if (target === 'multi') {
-      if (await tryOption(/multi[\s-]?language|несколько языков|мульти|кілька мов/i)) picked = 'multi';
+      if (await tryOption(/multi[\s-]?language|multiple languages|несколько языков|мульти|кілька мов/i)) picked = 'multi';
       else if (await tryOption(/russian|русский/i)) picked = 'russian';
     } else if (target === 'russian' || target === 'ru') {
       if (await tryOption(/russian|русский/i)) picked = 'russian';
@@ -121,15 +203,22 @@ export async function setCaptionLanguage(page, { target = 'multi', onEvent = () 
       if (await tryOption(new RegExp(target, 'i'))) picked = target;
     }
 
-    if (picked) log({ type: 'language-set', target, picked });
-    else log({ type: 'language-not-found', target });
+    if (picked) {
+      log({ type: 'language-set', target, picked });
+      await dump('05-picked');
+    } else {
+      log({ type: 'language-not-found', target });
+      await dump('05-pick-failed');
+    }
 
     // 6. Close the settings dialog.
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(300);
     await page.keyboard.press('Escape').catch(() => {});
+    log({ type: 'exit' });
   } catch (err) {
     log({ type: 'error', message: err.message });
+    await dump('99-error');
     await page.keyboard.press('Escape').catch(() => {});
   }
 }

@@ -1,4 +1,5 @@
 node_modules/
 chrome-profile/
 recordings/
+debug/
 .env
