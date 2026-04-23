@@ -171,8 +171,21 @@ export async function setCaptionLanguage(page, { target = 'multi', onEvent = () 
       await page.keyboard.press('Escape').catch(() => {});
       return;
     }
-    await langDropdown.first().click({ timeout: 5_000 });
-    log({ type: 'step-ok', step: '4-lang-dropdown-clicked' });
+    // Meet's Material Design combobox has a ripple layer (`jsname="GGAcbc"`)
+    // as a sibling that intercepts pointer events — Playwright's normal click
+    // retries forever waiting for a clear click target. `force: true` bypasses
+    // that actionability check; the synthetic click still bubbles up and the
+    // combobox opens. If that still fails, fall back to focus + Space.
+    const dd = langDropdown.first();
+    try {
+      await dd.click({ force: true, timeout: 3_000 });
+      log({ type: 'step-ok', step: '4-lang-dropdown-clicked', via: 'force-click' });
+    } catch (clickErr) {
+      log({ type: 'step-retry', step: '4-lang-dropdown', message: clickErr.message.slice(0, 200) });
+      await dd.focus().catch(() => {});
+      await page.keyboard.press('Space').catch(() => {});
+      log({ type: 'step-ok', step: '4-lang-dropdown-clicked', via: 'keyboard' });
+    }
     await page.waitForTimeout(500);
 
     // Dump the full option list — this is the single most useful debug
@@ -185,7 +198,8 @@ export async function setCaptionLanguage(page, { target = 'multi', onEvent = () 
     const tryOption = async (rx) => {
       const opt = page.getByRole('option', { name: rx });
       if (await opt.count().catch(() => 0)) {
-        await opt.first().click({ timeout: 3_000 });
+        // Same MD ripple-intercept issue as the combobox — force it.
+        await opt.first().click({ force: true, timeout: 3_000 });
         return true;
       }
       return false;
