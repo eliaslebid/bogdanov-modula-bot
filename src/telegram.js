@@ -45,6 +45,15 @@ export async function getMe() {
   return (await res.json()).result;
 }
 
+// Action-trigger phrases that should route to the reply handler even when the
+// user didn't explicitly name Bogdanov. Kept narrow and verb-anchored so
+// casual mentions of "задачи" or "встреча" don't false-positive.
+const ACTION_TRIGGERS = [
+  /(сделай|создай|проставь|распиши|нарежь|добавь)\b[\s\S]{0,40}?(задач|тикет)/i,
+  /(тикет|задач)[\s\S]{0,40}?(по|с|со|из|после)[\s\S]{0,20}?(встреч|митинг|созвон|груминг)/i,
+  /(управляй|разбери|почисти|обнови|проверь)\b[\s\S]{0,20}?(задач|тикет|issues|борд)/i,
+];
+
 function isMentionOfBot(text, botId, replyToMessage) {
   if (!text) return false;
   const lower = text.toLowerCase();
@@ -54,7 +63,8 @@ function isMentionOfBot(text, botId, replyToMessage) {
     || lower.includes('bogdanov')
     || lower.includes('богдан')
     || lower.includes('бодя');
-  return isReplyToBot || mentionsBot;
+  const actionTrigger = ACTION_TRIGGERS.some(rx => rx.test(text));
+  return isReplyToBot || mentionsBot || actionTrigger;
 }
 
 export async function startPolling(onMessage, onAnyMessage) {

@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import { config } from './config.js';
 import { sendMessage, startPolling } from './telegram.js';
 import { getCommitsSince, getPRsSince, getRepoTree, getFileContent, getLastCommitPerAuthor, getOpenIssues, getClosedIssues, createIssue, closeIssue, TEAM, tagByName, captureTelegramId } from './github.js';
-import { professionalReport, bogdanovComment, analyzeCodebase, weeklyMotivation, generateReply, shouldJumpIn, proactiveComment, analyzeIssues } from './ai.js';
+import { professionalReport, bogdanovComment, analyzeCodebase, weeklyMotivation, generateReply, shouldJumpIn, proactiveComment, analyzeIssues, classifyIntent, actionAck } from './ai.js';
 
 // Cached repo tree for quick access in replies
 let cachedRepoTree = null;
@@ -23,6 +23,8 @@ async function getRepoTreeCached() {
 import { addMessage, formatHistory, formatHistorySinceBotSpoke } from './history.js';
 import { loadProjectContext, startContextRefresh } from './context.js';
 import { handleMessageForMeet, getCurrentTranscript } from './meet.js';
+import { summarizeMeetingNotes } from './meetingNotes.js';
+import { createTicketsFromMeetingFile, createTicketsFromLatestMeeting } from './tickets.js';
 
 function getInactiveDevs(lastCommits) {
   const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
@@ -221,15 +223,26 @@ async function manageIssues(dryRun = false) {
 }
 
 // --- Track ALL messages + proactive jump-in ---
+// Cadence:
+//   - check at most every PROACTIVE_THRESHOLD human messages
+//   - never post within PROACTIVE_COOLDOWN_MS of Bogdanov's previous post
+// Both guards apply — both must pass before we even ask shouldJumpIn().
+const PROACTIVE_THRESHOLD = 5;
+const PROACTIVE_COOLDOWN_MS = 15 * 60 * 1000;
 let messagesSinceLastCheck = 0;
 let isChecking = false;
+let lastBotPostAt = 0;
 
 function trackMessage(msg, isMention = false) {
   captureTelegramId(msg);
   addMessage(msg);
 
-  // Don't count bot's own messages or messages already handled as mentions
-  if (msg.from?.is_bot) return;
+  // Bot's own messages don't count toward the threshold, but they DO reset
+  // the cooldown so we don't pile on right after a reply or scheduled report.
+  if (msg.from?.is_bot) {
+    lastBotPostAt = Date.now();
+    return;
+  }
 
   // Meet URL auto-trigger runs before the mention guard so pasting a link
   // alone (no mention, no reply) still pulls Bogdanov into the call.
@@ -239,12 +252,15 @@ function trackMessage(msg, isMention = false) {
 
   messagesSinceLastCheck++;
 
-  // Check if Bogdanov should jump in
-  if (messagesSinceLastCheck >= 1 && !isChecking) {
+  if (messagesSinceLastCheck < PROACTIVE_THRESHOLD || isChecking) return;
+  if (Date.now() - lastBotPostAt < PROACTIVE_COOLDOWN_MS) {
+    console.log('[PROACTIVE] Cooldown active, skipping jump-in check');
     messagesSinceLastCheck = 0;
-    isChecking = true;
-    checkAndJumpIn().finally(() => { isChecking = false; });
+    return;
   }
+  messagesSinceLastCheck = 0;
+  isChecking = true;
+  checkAndJumpIn().finally(() => { isChecking = false; });
 }
 
 async function checkAndJumpIn() {
@@ -262,7 +278,10 @@ async function checkAndJumpIn() {
       const comment = await proactiveComment(newMessages, openIssues);
       console.log(`[PROACTIVE] Sending: "${comment.slice(0, 100)}..."`);
       const sent = await sendMessage(comment);
-      if (sent?.result) addMessage(sent.result);
+      if (sent?.result) {
+        addMessage(sent.result);
+        lastBotPostAt = Date.now();
+      }
       console.log('[PROACTIVE] Comment sent.');
     }
   } catch (err) {
@@ -281,12 +300,27 @@ async function handleReply(msg) {
   console.log(`[REPLY] From ${userName}: "${userText}"`);
   console.log(`[REPLY] Replying to msg_id=${msg.message_id}, reply_to="${botMessageText.slice(0, 50)}"`);
 
-  // Check if user is asking to manage issues
-  const issueKeywords = ['управляй задачами', 'разбери задачи', 'manage issues', 'почисти issues', 'обнови задачи', 'проверь задачи', 'обнови борд', 'обнови борду'];
-  const lower = userText.toLowerCase();
-  if (issueKeywords.some(k => lower.includes(k))) {
-    console.log('[REPLY] Detected issue management request');
-    await sendMessage('Секунду, разбираюсь с задачами на GitHub...', msg.message_id);
+  // Semantic intent classification — replaces brittle keyword regexes.
+  // Returns one of: MEETING_TICKETS, ISSUE_AUDIT, REPLY.
+  const intent = await classifyIntent(userText, formatHistory(15));
+
+  if (intent === 'MEETING_TICKETS') {
+    const ack = await actionAck({ userText, action: 'нарезать тикеты по последней встрече и заасайнить их на команду' })
+      .catch(() => 'Окей, секунду блять...');
+    await sendMessage(ack, msg.message_id);
+    try {
+      await createTicketsFromLatestMeeting();
+    } catch (err) {
+      console.error('[REPLY] meeting-tickets failed:', err);
+      await sendMessage(`Не получилось: ${err.message}`);
+    }
+    return;
+  }
+
+  if (intent === 'ISSUE_AUDIT') {
+    const ack = await actionAck({ userText, action: 'разобрать и почистить открытые задачи на GitHub против кодбейса' })
+      .catch(() => 'Секунду, разбираюсь...');
+    await sendMessage(ack, msg.message_id);
     await manageIssues();
     return;
   }
@@ -323,8 +357,16 @@ if (!config.isDev) {
   console.log('[config] dev mode — cron schedules disabled');
 }
 
-// Pre-load project context from README.md + CLAUDE.md
-await loadProjectContext();
+// Pre-load project context from README.md + CLAUDE.md.
+// Defensive: a transient GitHub failure here used to crash the process and put
+// pm2 into a restart loop while DNS recovered. Now we just log and continue —
+// startContextRefresh will retry every 6h and individual reply paths fall back
+// gracefully when context is empty.
+try {
+  await loadProjectContext();
+} catch (err) {
+  console.error(`Initial project-context load failed: ${err.message} — continuing without it`);
+}
 startContextRefresh();
 
 console.log('Bogdanov bot started!');
@@ -345,6 +387,34 @@ if (arg === '--daily') {
   manageIssues().then(() => process.exit(0));
 } else if (arg === '--manage-issues-dry') {
   manageIssues(true).then(() => process.exit(0));
+} else if (arg === '--meeting-notes') {
+  const path = process.argv[3];
+  if (!path) {
+    console.error('Usage: node src/index.js --meeting-notes <file-or-dir> [--force] [--dry-run] [--deep] [--with-tickets]');
+    process.exit(1);
+  }
+  const force = process.argv.includes('--force');
+  const dryRun = process.argv.includes('--dry-run');
+  const deep = process.argv.includes('--deep');
+  const withTickets = process.argv.includes('--with-tickets');
+  (async () => {
+    await summarizeMeetingNotes(path, { force, dryRun, deep });
+    if (withTickets && !dryRun) {
+      console.log('[CLI] --with-tickets: extracting tickets from same notes…');
+      await createTicketsFromMeetingFile(path);
+    }
+  })()
+    .then(() => process.exit(0))
+    .catch((err) => { console.error(err); process.exit(1); });
+} else if (arg === '--meeting-tickets') {
+  const path = process.argv[3];
+  if (!path) {
+    console.error('Usage: node src/index.js --meeting-tickets <file>');
+    process.exit(1);
+  }
+  createTicketsFromMeetingFile(path)
+    .then(() => process.exit(0))
+    .catch((err) => { console.error(err); process.exit(1); });
 } else if (arg === '--test') {
   sendMessage('<b>Bogdanov</b> на связи. Слежу за вашим кодом. Всегда слежу.')
     .then(() => { console.log('Test message sent.'); process.exit(0); });

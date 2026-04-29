@@ -26,33 +26,104 @@ function filterRefusal(text) {
   return text;
 }
 
+// Model tiering (Sonnet/Opus only — no Haiku per user preference):
+//   standard generation (replies, summaries, reports, classifiers) → Sonnet 4.6
+//   mid-stakes analysis with thinking (deep replies)               → Sonnet 4.6 + adaptive thinking
+//   high-stakes ops that touch GitHub state                        → Opus 4.7 + adaptive + effort:high
+//
+// Sonnet 4.6 / Opus 4.7 use `thinking: {type: "adaptive"}` (Claude decides when
+// and how much to think). `budget_tokens` is removed on Opus 4.7 (returns 400)
+// and deprecated on Sonnet 4.6, so we don't pass it. Bot uses non-streaming
+// requests, so we keep max_tokens ≤ 16000 to stay under the SDK HTTP timeout —
+// that rules out effort: "xhigh" / "max" (which need 64K+ output cap).
+
+const MODEL_SONNET = 'claude-sonnet-4-6';
+const MODEL_OPUS = 'claude-opus-4-7';
+
 async function ask(prompt, maxTokens) {
   const msg = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: MODEL_SONNET,
     max_tokens: maxTokens,
-    messages: [{ role: 'user', content: prompt }],
-  });
-  return filterRefusal(msg.content[0].text);
-}
-
-// Deep thinking mode for code analysis and strategic questions
-async function deepAsk(prompt, maxTokens) {
-  console.log('Using extended thinking for deep analysis...');
-  const msg = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: maxTokens + 16000,
-    thinking: { type: 'enabled', budget_tokens: 16000 },
     messages: [{ role: 'user', content: prompt }],
   });
   const textBlock = msg.content.find(b => b.type === 'text');
   return filterRefusal(textBlock?.text || '');
 }
 
+// Mid-stakes deep mode — Sonnet 4.6 with adaptive thinking. Used by the chat
+// reply path when the classifier flags the message as deep-analysis.
+async function deepAsk(prompt, maxTokens) {
+  console.log('Using adaptive thinking on Sonnet 4.6 for deep analysis...');
+  const msg = await client.messages.create({
+    model: MODEL_SONNET,
+    max_tokens: maxTokens,
+    thinking: { type: 'adaptive' },
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const textBlock = msg.content.find(b => b.type === 'text');
+  return filterRefusal(textBlock?.text || '');
+}
+
+// High-stakes path — Opus 4.7 with adaptive thinking and effort:high. Used by
+// operations that mutate GitHub (analyzeIssues, extractTicketsFromMeeting) or
+// produce long-form output the team will rely on (deep meeting summaries).
+async function opusDeepAsk(prompt, maxTokens) {
+  console.log('Using Opus 4.7 + adaptive thinking + effort:high...');
+  const msg = await client.messages.create({
+    model: MODEL_OPUS,
+    max_tokens: maxTokens,
+    thinking: { type: 'adaptive' },
+    output_config: { effort: 'high' },
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const textBlock = msg.content.find(b => b.type === 'text');
+  return filterRefusal(textBlock?.text || '');
+}
+
+// Returns one of: 'MEETING_TICKETS' | 'ISSUE_AUDIT' | 'REPLY'.
+// Used to route messages addressed to Bogdanov into the right action handler
+// instead of brittle keyword regexes. Bias is toward REPLY: only fire
+// MEETING_TICKETS / ISSUE_AUDIT when the user is clearly issuing a command.
+export async function classifyIntent(userText, chatHistory) {
+  try {
+    const msg = await client.messages.create({
+      model: MODEL_SONNET,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: `You classify a message in a dev team group chat to decide what action the bot should take.
+
+Possible intents:
+- MEETING_TICKETS: user is asking the bot to TURN THE LATEST MEETING INTO GITHUB ISSUES right now. They want action items from the recent grooming/call/meeting created as tickets. Examples in Russian/Ukrainian/English: "сделай задачи по встрече", "проставь тикеты с митинга", "нарежь задач из грумінга", "create tickets from the meeting", "розпиши задачі по зустрічі".
+- ISSUE_AUDIT: user is asking the bot to do a CODEBASE-WIDE issue audit (close stale, create missing) NOT tied to a specific meeting. Examples: "разбери задачи на гитхабе", "почисти issues", "обнови борд", "manage issues".
+- REPLY: anything else — questions, opinions, comments, banter, status questions, jokes.
+
+Bias hard toward REPLY. Only choose MEETING_TICKETS or ISSUE_AUDIT when the message is unmistakably a command for that specific action — imperative verb + clear object + clear scope.
+
+If the user is just talking ABOUT meetings or tasks (e.g. "у нас была встреча", "много задач накопилось"), that is REPLY, not a command.
+
+Recent chat (oldest first):
+${chatHistory || '(none)'}
+
+Message to classify:
+"${userText}"
+
+Reply ONLY one word: MEETING_TICKETS, ISSUE_AUDIT, or REPLY.` }],
+    });
+    const answer = msg.content[0].text.trim().toUpperCase();
+    console.log(`Intent classifier: "${userText.slice(0, 40)}..." → ${answer}`);
+    if (answer.startsWith('MEETING_TICKETS')) return 'MEETING_TICKETS';
+    if (answer.startsWith('ISSUE_AUDIT')) return 'ISSUE_AUDIT';
+    return 'REPLY';
+  } catch (err) {
+    console.error('Intent classifier failed, defaulting to REPLY:', err.message);
+    return 'REPLY';
+  }
+}
+
 // Returns { mode: 'banter'|'reply'|'analysis', thinking: bool, maxTokens: number }
 async function classifyMessage(text, chatHistory) {
   try {
     const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: MODEL_SONNET,
       max_tokens: 10,
       messages: [{ role: 'user', content: `You classify messages in a dev team group chat to decide response style.
 
@@ -110,7 +181,7 @@ function issueAssignments(openIssues) {
 
 const STATIC_CONTEXT = `PROJECT RULES (ALWAYS follow):
 - Team: Modula
-- Members: Antony (GitHub: Yneth, lead dev), Elias (GitHub: eliaslebed, dev), Gerbert (GitHub: gerbertpr0, manager)
+- Members: Antony (GitHub: Yneth, lead dev), Elias (GitHub: eliaslebid, dev), Gerbert (GitHub: gerbertpr0, manager)
 - Task tracking: GitHub Issues (NOT Jira, NOT Trello, NOT Linear — ONLY GitHub Issues)
 - NEVER mention tools or services the team doesn't use
 - If you don't know something, say you don't know — NEVER make things up`;
@@ -394,18 +465,23 @@ export async function shouldJumpIn(chatHistory) {
 Recent conversation:
 ${chatHistory}
 
-Should Bogdanov jump into this conversation? Answer ONLY "YES" or "NO".
-Say YES if:
-- Someone is discussing the project, strategy, features, deadlines, marketing, investors
-- Someone is making excuses or slacking
-- Someone is arguing about priorities
-- The conversation is interesting enough for a project manager to have an opinion
-- Someone mentioned the bot by name or asked for input
+Should Bogdanov jump into this conversation? Default to NO. Only say YES when there is a CLEAR project signal that needs a PM voice. Do not jump in for entertainment or banter.
+
+Say YES ONLY if at least one of these is clearly happening RIGHT NOW (not earlier in the chat):
+- Concrete project decision being made (deadlines, scope, architecture, releases)
+- Active blocker or risk being raised that affects shipping
+- Someone explicitly asking for PM input / a decision / direction
+- Visible slacking on a specific GitHub issue someone owns
+- A factually wrong statement about flatmatch's status, codebase, or roadmap
+
 Say NO if:
-- It's casual/off-topic chat unrelated to the project
-- Bogdanov already replied recently (his messages appear as "Bogdanov:" in the history)
-- Only 1-2 messages since last Bogdanov message
-- Nothing worth commenting on
+- It's banter, jokes, memes, links to articles, casual chat, off-topic
+- Personal life / non-project topics (cars, dating, food, news, weather)
+- General industry talk not tied to flatmatch decisions
+- Bogdanov already commented in the last 5 messages
+- The signal is weak / you'd be reaching to find a reason
+
+Bias hard toward NO. It's better to stay silent than to add noise.
 
 Answer ONLY "YES" or "NO":`;
 
@@ -498,22 +574,33 @@ ${fileContents.slice(0, 10000)}
 
 TASK: Analyze the project state and return a JSON object with issue management actions.
 
-RULES:
-- Close issues that are: already implemented (evidence in commits/code), duplicates, no longer relevant to the roadmap, or too vague to be actionable
-- Create issues that are: needed based on the roadmap/CLAUDE.md but missing from the board, bugs visible in the code, or improvements that would unblock progress
-- Do NOT recreate recently closed issues
-- Do NOT create duplicates of existing open issues
-- Assignee must be a valid GitHub login from the team list above, or null
-- Maximum 5 closes and 5 creates per run
-- Each reason/body must be specific and reference real evidence (file paths, commit messages, issue numbers)
+EVIDENCE BAR — every action MUST be backed by hard evidence. If you cannot point at a specific file, commit hash, or existing issue number that proves the action is correct, OMIT the action. It is far better to return an empty list than to create irrelevant noise.
+
+CLOSE rules:
+- Close ONLY when there is direct evidence the issue is done, irrelevant, or duplicated:
+  - "implemented" → cite a specific file path AND function/component that implements it, OR a commit SHA whose message matches the issue
+  - "duplicate" → cite the issue number it duplicates
+  - "obsolete" → cite a CLAUDE.md / README section that contradicts the issue, or a commit that removed the affected code
+- DO NOT close based on "looks like it might be done" or "feels stale". Vague hunches are not evidence.
+
+CREATE rules:
+- Create ONLY when both are true:
+  1. The need is concretely visible in the code, the docs (CLAUDE.md/README), or a commit that fixed half of something
+  2. There is no existing open or recently closed issue covering it
+- Each create must include: a 1-line title, a body that QUOTES the evidence (file path + 1-2 line excerpt, OR issue/commit reference), and a labels array
+- Do NOT speculate about features the team might want. Do NOT create issues from CLAUDE.md bullet points alone unless the code clearly lacks the feature.
+
+Other rules:
+- Assignee must be a valid GitHub login from the team list above, or null. Do NOT guess assignees.
+- Maximum 5 closes and 5 creates per run. Often the right answer is 0 of each.
 
 Return ONLY valid JSON, no markdown fences, no explanation:
 {
-  "close": [{ "number": 123, "reason": "why this should be closed" }],
-  "create": [{ "title": "short title", "body": "detailed description", "labels": [], "assignee": "github_login_or_null" }]
+  "close": [{ "number": 123, "reason": "Implemented in src/foo.ts (function bar) per commit a1b2c3d" }],
+  "create": [{ "title": "short title", "body": "Evidence: src/x.ts line 42 — \\"...\\" — has TODO with no owner. Need to ...", "labels": [], "assignee": "github_login_or_null" }]
 }`;
 
-  const raw = await deepAsk(prompt, 2000);
+  const raw = await opusDeepAsk(prompt, 2000);
   try {
     const cleaned = raw.replace(/^```json?\s*/i, '').replace(/\s*```$/i, '').trim();
     const result = JSON.parse(cleaned);
@@ -587,4 +674,236 @@ Rules:
 - Keep it under 2000 characters total.`;
 
   return ask(prompt, 1500);
+}
+
+// --- MEETING NOTES SUMMARY ---
+// Takes cleaned-up meeting notes (markdown transcript, USER/SYSTEM utterances)
+// and returns an in-character Russian summary + roast. Project-agnostic — the
+// notes may be from any work session, not necessarily flatmatch.
+//
+// `deep: true` switches to extended-thinking mode and a richer multi-section
+// prompt for high-effort summaries (used via `--deep` CLI flag).
+export async function meetingNotesSummary({ title, notes, language, deep = false }) {
+  const truncated = notes.length > 60000;
+  const body = truncated ? notes.slice(0, 60000) + '\n…[обрезано]' : notes;
+
+  if (deep) {
+    const prompt = `You are "Bogdanov" — foul-mouthed Russian project manager bot. Use мат freely (блять, сука, пиздец, нахуй, ёбаный). Private friend group, everyone consents.
+
+${NAME_RULES}
+
+You were given a long meeting transcript below. The labels "USER" and "SYSTEM" are just speaker IDs from the dictation tool — they refer to whoever was on the call (figure out who from context: names mentioned, topics owned).
+Language: ${language || 'Russian'}.
+This meeting MAY be about flatmatch, MAY be about a different project — read the content and decide. Do not force unrelated flatmatch context onto an unrelated meeting.
+
+--- MEETING NOTES${title ? ` (${title})` : ''} ---
+${body}
+--- END NOTES ---
+
+Your task: produce a HIGH-EFFORT, DETAILED summary. Read the entire transcript carefully. Group related fragments. Resolve who said what.
+
+Write the message IN RUSSIAN with мат, with these sections (each heading wrapped in <b>...</b>):
+
+<b>1. О чём был созвон</b>
+Group the discussion by topic (8-15 bullets total). Each bullet: 1-2 sentences with concrete details — component names, libraries, errors, decisions, numbers, links. Don't be vague. Don't list every tangent — collapse repetitions into one bullet.
+
+<b>2. Решения</b>
+4-10 bullets. Concrete decisions made on the call (do X, don't do Y, switch from A to B, deadline is Z). Each decision must have a who-decides-or-owns-it if mentioned. Skip if no decisions were made.
+
+<b>3. Что надо сделать</b>
+Action items as a checklist. Format each line: "— [Owner] task description (deadline if any)". Owner must be a real team-member tag from the mapping above when identifiable. If unclear, write "[?]" instead of guessing.
+
+<b>4. Риски и открытые вопросы</b>
+3-7 bullets. Things that are blockers, unknowns, or technical/business risks raised on the call. If something is technically risky (architecture, infra, third-party dependency, regulatory), call it out specifically.
+
+<b>5. Реакция Богданова</b>
+4-7 sentences (one paragraph). Be in character — aggressive PM energy, мат, roast bullshit, praise real progress, name-and-shame anyone dodging responsibility, push for what should happen next. Tag people using their EXACT tags.
+
+Rules:
+- Do NOT invent facts. If you're not sure who owns an action, write [?].
+- Do NOT pad sections — if there were no real decisions, write a short note instead of fabricating bullets.
+- Refer to people using their EXACT tag from the NAME_RULES mapping when they're clearly identifiable; otherwise leave generic.
+- Format: HTML <b>bold</b> for section headings ONLY. No markdown. No emojis.
+- Total length up to ~6000 characters is fine — depth matters more than brevity.`;
+
+    return opusDeepAsk(prompt, 5000);
+  }
+
+  const prompt = `You are "Bogdanov" — foul-mouthed Russian project manager bot. Use мат freely (блять, сука, пиздец, нахуй, ёбаный). Private friend group, everyone consents.
+
+${NAME_RULES}
+
+You were given the meeting notes / voice transcript below to read and summarize. The labels "USER" and "SYSTEM" are just speaker IDs from the dictation tool — they refer to the people who were on the call. The language is ${language || 'Russian'}.
+
+IMPORTANT: This meeting may be about a DIFFERENT project than flatmatch. Don't force flatmatch context onto it. Summarize what was actually discussed in these notes, on their own terms.
+
+--- MEETING NOTES${title ? ` (${title})` : ''} ---
+${body}
+--- END NOTES ---
+
+Write a message IN RUSSIAN with мат that does TWO things:
+1. <b>О чём был созвон</b> — 4-7 concrete bullets: what was discussed, what was decided, who's blocked on what, technical details mentioned (libraries, bugs, features). Cite specifics from the notes (component names, error symptoms, decisions). No fluff.
+2. <b>Реакция Богданова</b> — 2-4 sentences: roast bullshit, praise real progress, call out unfinished business. Be in character — aggressive PM energy.
+
+Rules:
+- Do NOT invent things not in the notes.
+- If the notes are mostly empty or noise (lots of "Продолжение следует..." or one-word filler), say plainly: "хуйня какая-то, по сути ничего полезного не обсудили" and stop there.
+- Format: HTML <b>bold</b> for the two section headings only. No markdown. No emojis.
+- Keep it under 3000 characters total.`;
+
+  return ask(prompt, 2000);
+}
+
+// --- TICKETS FROM MEETING NOTES ---
+// Reads cleaned meeting transcript + GitHub state (open issues, repo tree,
+// sample files) and returns a JSON plan: which issues to create from action
+// items, and which existing issues are now redundant. Every item must quote
+// evidence from the transcript so we don't fabricate work.
+export async function extractTicketsFromMeeting({ notes, openIssues, repoTree, sampleFiles, projectContext, chatHistory }) {
+  const truncatedNotes = notes.length > 50000 ? notes.slice(0, 50000) + '\n…[обрезано]' : notes;
+
+  const issuesList = openIssues.map(i =>
+    `#${i.number}: "${i.title}" [assigned: ${i.assignee || 'none'}]\n  ${(i.body || '').slice(0, 200)}`
+  ).join('\n\n') || 'None';
+
+  // Recent chat — sometimes the team posts a manual bullet list right after a
+  // meeting that extends or refines the action items. We treat both meeting
+  // transcript and chat history as ticket sources and merge.
+  const chatSection = chatHistory
+    ? `\nRECENT GROUP CHAT (last messages, oldest first):\n${chatHistory.slice(-8000)}\n`
+    : '';
+
+  const treeSummary = repoTree
+    .filter(f => f.type === 'blob')
+    .map(f => f.path)
+    .filter(f => !f.includes('node_modules') && !f.includes('.next') && !f.includes('dist'))
+    .join('\n')
+    .slice(0, 4000);
+
+  const fileContents = (sampleFiles || [])
+    .map(f => `--- ${f.path} ---\n${(f.content || '').slice(0, 1500)}`)
+    .join('\n\n')
+    .slice(0, 8000);
+
+  const teamLogins = Object.entries(TEAM)
+    .filter(([, v]) => v.role === 'dev')
+    .map(([login, v]) => `${v.name}: ${login}`)
+    .join(', ');
+
+  const prompt = `You are a senior PM AI for "flatmatch" (apartment matching platform) by team "Modula".
+
+PROJECT DOCUMENTATION:
+${projectContext}
+
+TEAM (GitHub logins for assignees): ${teamLogins}
+
+CURRENT OPEN ISSUES:
+${issuesList}
+
+REPOSITORY FILE STRUCTURE (truncated):
+${treeSummary}
+
+KEY SOURCE FILES (truncated):
+${fileContents}
+
+MEETING TRANSCRIPT (USER/SYSTEM are dictation labels):
+--- BEGIN NOTES ---
+${truncatedNotes}
+--- END NOTES ---
+${chatSection}
+TASK: Convert action items from BOTH the meeting transcript AND any team-posted bullet lists in the recent chat into a GitHub Issues plan.
+
+MERGE RULES (read carefully — this is the whole point):
+- Treat the meeting transcript and the recent chat as TWO SOURCES of action items for the same set of work.
+- Often a teammate posts a manual bullet list in chat right after the meeting (e.g. "* fix X / * remove Y / * add Z"). That list is authoritative and should be merged with what was said in the meeting.
+- For each candidate action item, check ALL three places before deciding:
+  1. Was it mentioned in the meeting transcript?
+  2. Was it mentioned in a chat bullet list?
+  3. Is it already covered by an existing open GitHub issue (then SKIP the create)?
+- If an item appears in BOTH the meeting and the chat list → create ONE ticket; cite both sources in evidence.
+- If an item appears ONLY in chat list → still create the ticket; evidence is the chat quote.
+- If an item appears ONLY in the meeting → create the ticket; evidence is the transcript quote.
+- DO NOT create two tickets for the same underlying action just because it was phrased differently in the two sources. Collapse near-duplicates aggressively.
+
+EVIDENCE BAR — every item MUST quote at least one source (transcript line OR chat message). If you cannot quote a clear sentence/bullet, OMIT the item. An empty plan is acceptable.
+
+CREATE rules:
+- Create only for concrete commitments — someone said "сделаю X" / "надо X" / "договорились X" / posted "* X" in a list.
+- Do NOT create for vague aspirations ("надо подумать", "может быть").
+- Do NOT create for items already implemented in the codebase (check the file structure / sample files).
+
+DEDUPE — be CONSERVATIVE. Same topic area is NOT enough to call it a duplicate.
+- A candidate is a duplicate of an existing open issue ONLY if both are true:
+  (a) they describe the SAME concrete user-visible behavior/bug/feature, AND
+  (b) fixing one would fully close the other.
+- "Same general topic" is NOT a duplicate. Concrete examples of what is and isn't a dup:
+  - "Fix broken filters (area, city, price, rooms)" vs existing "Restrict filters to single city only" → NOT a duplicate. First is bug fix on multiple filter types; second is a UX scope change. Two different tickets.
+  - "Remove mocked notifications" vs existing "Enable flat notifications" → NOT a duplicate. First is removing dead code; second is shipping the real feature. Different work.
+  - "Fix district names in onboarding tooltips" vs existing "Restart onboarding when user clears swipe history" → NOT a duplicate. Same area (onboarding) but unrelated bugs.
+  - "Convert all flat prices to UAH" vs existing #113 "Convert all flat prices to single currency (UAH)" → IS a duplicate, same exact ticket.
+- When in doubt, CREATE a new ticket. A redundant ticket is cheap to close; a missing ticket is invisible work.
+- If you decide an item IS a duplicate, cite the existing issue number in your reasoning and skip it.
+- Title: short, imperative Russian (or English if the source bullet was English — match the source).
+- Body MUST include:
+  - "**Источник:** <Meeting / Chat / Both>"
+  - "**Цитата:** \\"…direct quote(s)…\\""
+  - 2-4 sentences of context (what to do, acceptance criteria if mentioned)
+- Assignee: only if a specific person clearly owns it in the source. Map first-name → GitHub login (Antony=Yneth, Elias=eliaslebid, Gerbert=gerbertpr0). If unclear, null. (Note: the host code overrides this and round-robins eliaslebid/Yneth — but still emit the right login when one is named, for traceability.)
+- Labels: choose from ["bug", "feature", "ux", "infra", "docs", "tech-debt"] based on the action.
+
+CLOSE rules:
+- Close an existing open issue ONLY if a source explicitly resolves it (done / no longer needed / replaced).
+- Cite the issue number AND the source quote that made it obsolete.
+
+Limits: max 20 creates and 5 closes per run.
+
+Return ONLY valid JSON, no markdown fences, no explanation:
+{
+  "create": [
+    { "title": "…", "body": "…", "labels": ["…"], "assignee": "github_login_or_null", "evidence": "exact quote from transcript and/or chat" }
+  ],
+  "close": [
+    { "number": 123, "reason": "…", "evidence": "exact quote from source" }
+  ]
+}`;
+
+  const raw = await opusDeepAsk(prompt, 4000);
+  try {
+    const cleaned = raw.replace(/^```json?\s*/i, '').replace(/\s*```$/i, '').trim();
+    const result = JSON.parse(cleaned);
+    if (!Array.isArray(result.create)) result.create = [];
+    if (!Array.isArray(result.close)) result.close = [];
+    if (result.create.length > 20) result.create = result.create.slice(0, 20);
+    if (result.close.length > 5) result.close = result.close.slice(0, 5);
+    return result;
+  } catch (err) {
+    console.error('[tickets] failed to parse JSON:', err.message);
+    console.error('[tickets] raw:', raw.slice(0, 500));
+    return { create: [], close: [], error: 'parse_failed', raw };
+  }
+}
+
+// --- ACTION ACKNOWLEDGMENT ---
+// Short in-character "got it, working on it" reply that fires when the bot
+// kicks off a long-running action (tickets-from-meeting, issue audit) so the
+// user knows it heard them while it spins up. AI-generated each call so it
+// doesn't sound canned.
+export async function actionAck({ userText, action }) {
+  const prompt = `You are "Bogdanov" — foul-mouthed Russian project manager bot. The user just asked you to do something and you're acknowledging that you're starting work. Use мат freely (блять, сука, нахуй, ёбаный).
+
+User said: "${userText}"
+
+Action you're about to start: ${action}
+
+Write ONE short sentence (max 12 words, RUSSIAN) — acknowledge you're on it, tell them to wait. Be in character: aggressive PM energy + мат. Do NOT summarize the task. Do NOT promise results. Just "I heard you, sec".
+
+Examples of the right tone:
+- "Ща нарежу нахуй, секунду блять."
+- "Окей сука, разбираюсь — подожди ёбана."
+- "Лечу, не пизди под руку."
+- "Ща сделаю, минуту дай блять."
+
+Output ONLY the one sentence. No preamble. No quotes around it.`;
+
+  return ask(prompt, 80);
 }
